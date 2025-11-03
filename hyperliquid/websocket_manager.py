@@ -37,6 +37,12 @@ def subscription_to_identifier(subscription: Subscription) -> str:
         return f'activeAssetCtx:{subscription["coin"].lower()}'
     elif subscription["type"] == "activeAssetData":
         return f'activeAssetData:{subscription["coin"].lower()},{subscription["user"].lower()}'
+    elif subscription["type"] == "clearinghouseState":
+        return f'clearinghouseState:{subscription["user"].lower()},{subscription.get("dex", "")}'
+    elif subscription["type"] == "openOrders":
+        return f'openOrders:{subscription["user"].lower()},{subscription.get("dex", "")}'
+    else:
+        raise ValueError(f"Unknown subscription type: {subscription.get('type')}")
 
 
 def ws_msg_to_identifier(ws_msg: WsMsg) -> Optional[str]:
@@ -72,6 +78,10 @@ def ws_msg_to_identifier(ws_msg: WsMsg) -> Optional[str]:
         return f'activeAssetCtx:{ws_msg["data"]["coin"].lower()}'
     elif ws_msg["channel"] == "activeAssetData":
         return f'activeAssetData:{ws_msg["data"]["coin"].lower()},{ws_msg["data"]["user"].lower()}'
+    elif ws_msg["channel"] == "clearinghouseState":
+        return f'clearinghouseState:{ws_msg["data"]["user"].lower()},{ws_msg["data"].get("dex", "")}'
+    elif ws_msg["channel"] == "openOrders":
+        return f'openOrders:{ws_msg["data"]["user"].lower()},{ws_msg["data"].get("dex", "")}'
 
 
 class WebsocketManager(threading.Thread):
@@ -81,14 +91,24 @@ class WebsocketManager(threading.Thread):
         self.ws_ready = False
         self.queued_subscriptions: List[Tuple[Subscription, ActiveSubscription]] = []
         self.active_subscriptions: Dict[str, List[ActiveSubscription]] = defaultdict(list)
+        self.subscription_registry: Dict[str, Subscription] = {}  # Store original subscriptions for reconnect
+        self.base_url = base_url
         ws_url = "ws" + base_url[len("http") :] + "/ws"
-        self.ws = websocket.WebSocketApp(ws_url, on_message=self.on_message, on_open=self.on_open)
+        self.ws = websocket.WebSocketApp(
+            ws_url,
+            on_message=self.on_message,
+            on_open=self.on_open,
+            on_close=self.on_close,
+            on_error=self.on_error
+        )
         self.ping_sender = threading.Thread(target=self.send_ping)
         self.stop_event = threading.Event()
+        self.should_reconnect = True
 
     def run(self):
         self.ping_sender.start()
-        self.ws.run_forever()
+        # run_forever with reconnect parameter enables automatic reconnection
+        self.ws.run_forever(reconnect=5)  # Reconnect with 5 second delay
 
     def send_ping(self):
         while not self.stop_event.wait(50):
@@ -99,6 +119,7 @@ class WebsocketManager(threading.Thread):
         logging.debug("Websocket ping sender stopped")
 
     def stop(self):
+        self.should_reconnect = False
         self.stop_event.set()
         self.ws.close()
         if self.ping_sender.is_alive():
@@ -125,10 +146,22 @@ class WebsocketManager(threading.Thread):
                 active_subscription.callback(ws_msg)
 
     def on_open(self, _ws):
-        logging.debug("on_open")
+        logging.info("✅ Hyperliquid WebSocket connected")
         self.ws_ready = True
+        
+        # Process queued subscriptions (initial connection)
         for subscription, active_subscription in self.queued_subscriptions:
             self.subscribe(subscription, active_subscription.callback, active_subscription.subscription_id)
+        
+        # Resubscribe to all existing subscriptions (reconnect)
+        if self.subscription_registry:
+            logging.info(f"🔄 Restoring {len(self.subscription_registry)} subscription(s) after reconnect")
+            for identifier, subscription in self.subscription_registry.items():
+                try:
+                    self.ws.send(json.dumps({"method": "subscribe", "subscription": subscription}))
+                    logging.debug(f"Restored subscription: {identifier}")
+                except Exception as e:
+                    logging.error(f"Failed to restore subscription {identifier}: {e}")
 
     def subscribe(
         self, subscription: Subscription, callback: Callable[[Any], None], subscription_id: Optional[int] = None
@@ -147,9 +180,24 @@ class WebsocketManager(threading.Thread):
                 if len(self.active_subscriptions[identifier]) != 0:
                     raise NotImplementedError(f"Cannot subscribe to {identifier} multiple times")
             self.active_subscriptions[identifier].append(ActiveSubscription(callback, subscription_id))
+            self.subscription_registry[identifier] = subscription  # Store for reconnect
             self.ws.send(json.dumps({"method": "subscribe", "subscription": subscription}))
         return subscription_id
 
+    def on_close(self, _ws, close_status_code, close_msg):
+        """Handle WebSocket close event."""
+        logging.warning(f"⚠️ Hyperliquid WebSocket closed: {close_status_code} - {close_msg}")
+        self.ws_ready = False
+        
+        if self.should_reconnect:
+            logging.info("🔄 Will reconnect automatically...")
+        else:
+            logging.info("Shutdown requested, will not reconnect")
+    
+    def on_error(self, _ws, error):
+        """Handle WebSocket error event."""
+        logging.error(f"❌ Hyperliquid WebSocket error: {error}")
+    
     def unsubscribe(self, subscription: Subscription, subscription_id: int) -> bool:
         if not self.ws_ready:
             raise NotImplementedError("Can't unsubscribe before websocket connected")
@@ -158,5 +206,8 @@ class WebsocketManager(threading.Thread):
         new_active_subscriptions = [x for x in active_subscriptions if x.subscription_id != subscription_id]
         if len(new_active_subscriptions) == 0:
             self.ws.send(json.dumps({"method": "unsubscribe", "subscription": subscription}))
+            # Remove from registry if no more active subscriptions
+            if identifier in self.subscription_registry:
+                del self.subscription_registry[identifier]
         self.active_subscriptions[identifier] = new_active_subscriptions
         return len(active_subscriptions) != len(new_active_subscriptions)

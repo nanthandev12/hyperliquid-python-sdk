@@ -53,6 +53,12 @@ ActiveAssetCtxSubscription = TypedDict("ActiveAssetCtxSubscription", {"type": Li
 ActiveAssetDataSubscription = TypedDict(
     "ActiveAssetDataSubscription", {"type": Literal["activeAssetData"], "user": str, "coin": str}
 )
+ClearinghouseStateSubscription = TypedDict(
+    "ClearinghouseStateSubscription", {"type": Literal["clearinghouseState"], "user": str, "dex": NotRequired[str]}
+)
+OpenOrdersSubscription = TypedDict(
+    "OpenOrdersSubscription", {"type": Literal["openOrders"], "user": str, "dex": NotRequired[str]}
+)
 # If adding new subscription types that contain coin's don't forget to handle automatically rewrite name to coin in info.subscribe
 Subscription = Union[
     AllMidsSubscription,
@@ -68,6 +74,8 @@ Subscription = Union[
     WebData2Subscription,
     ActiveAssetCtxSubscription,
     ActiveAssetDataSubscription,
+    ClearinghouseStateSubscription,
+    OpenOrdersSubscription,
 ]
 
 AllMidsData = TypedDict("AllMidsData", {"mids": Dict[str, str]})
